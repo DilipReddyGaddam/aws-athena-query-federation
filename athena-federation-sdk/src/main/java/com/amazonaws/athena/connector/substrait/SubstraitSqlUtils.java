@@ -80,8 +80,10 @@ public final class SubstraitSqlUtils
     private static SqlNode getSqlNodeFromSubstraitPlan(final Plan protoPlan, final SqlDialect sqlDialect)
     {
         final RelNode node = getRelNodeFromSubstraitPlan(protoPlan, sqlDialect);
+        System.out.println(node);
         final RelToSqlConverter converter = new RelToSqlConverter(sqlDialect);
-        return converter.visitRoot(node).asStatement();
+        SqlNode nodeSQL =  converter.visitRoot(node).asStatement();
+        return nodeSQL;
     }
 
     public static Schema getTableSchemaFromSubstraitPlan(final String planString, final SqlDialect sqlDialect)

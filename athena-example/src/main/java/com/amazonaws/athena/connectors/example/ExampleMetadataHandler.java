@@ -143,14 +143,10 @@ public class ExampleMetadataHandler
 
         List<TableName> tables = new ArrayList<>();
 
-        /**
-         * TODO: Add tables for the requested schema, example below
-         *
          tables.add(new TableName(request.getSchemaName(), "table1"));
          tables.add(new TableName(request.getSchemaName(), "table2"));
          tables.add(new TableName(request.getSchemaName(), "table3"));
-         *
-         */
+
 
         String nextToken = null;
         int pageSize = request.getPageSize();

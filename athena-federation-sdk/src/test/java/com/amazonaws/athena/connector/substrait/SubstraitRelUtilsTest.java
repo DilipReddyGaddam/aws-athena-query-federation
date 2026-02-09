@@ -28,7 +28,9 @@ import io.substrait.proto.Rel;
 import io.substrait.proto.SortRel;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -213,6 +215,18 @@ class SubstraitRelUtilsTest
         FilterRel result = SubstraitRelUtils.getFilterRel(null);
         
         assertNull(result);
+    }
+
+    @Test
+    void testDeserializeSubstraitPlanValid11()
+    {
+        Plan originalPlan = Plan.newBuilder().build();
+        byte[] planBytes = originalPlan.toByteArray();
+       // String encodedPlan = "GqoBEqcBCqQBGqEBCgIKABKWAQqTAQoCCgAScQoFY2FyaWQKBW1vZGVsCgR5ZWFyCgZzdGF0dXMKB21pbGVhZ2UKBXByaWNlCgRtc3ByCglwYXJ0aXRpb24SMgoEOgIQAQoEYgIQAQoEYgIQAQoEYgIQAQoEYgIQAQoEYgIQAQoEYgIQAQoEYgIQARgCOhoKEGNhcl9zY2hlbWFfbG93ZXIKBmNhcnNpZBgAIAo=";
+        String encodedPlan = "Ch4IAxIaL2Z1bmN0aW9uc19hcml0aG1ldGljLnlhbWwKGwgBEhcvZnVuY3Rpb25zX2Jvb2xlYW4ueWFtbAoeCAISGi9mdW5jdGlvbnNfY29tcGFyaXNvbi55YW1sEg4aDAgBGghhbmQ6Ym9vbBISGhAIAhABGgpndDphbnlfYW55EhMaEQgDEAIaC2FkZDppMzJfaTMyGocDEoQDCoEDGv4CCgIKABLzAirwAgoCCgAS2wI62AIKAgoAEqMCEqACCgIKABLDAQrAAQoCCgASpwEKCWNfY3VzdGtleQoGY19uYW1lCgljX2FkZHJlc3MKC2NfbmF0aW9ua2V5CgdjX3Bob25lCgljX2FjY3RiYWwKDGNfbWt0c2VnbWVudAoJY19jb21tZW50Cg5wYXJ0aXRpb25fbmFtZRI9CgQqAhABCgRiAhABCgRiAhABCgQqAhABCgRiAhABCgnCAQYIAhAPIAEKBGICEAEKBGICEAEKBGICEAEYAjoQCgR0cGNoCghjdXN0b21lchpUGlIaBAoCEAEiCRoHCgUIAZADASI/Gj0aOwgBGgQKAhABIiYaJBoiCAIaBCoCEAEiDBoKEggKBBICCAMiACIKGggSBgoCEgAiACIJGgcKBSgKkAMBGgoSCAoEEgIIAiIAGgoSCAoEEgIIAyIAGggSBgoCEgAiABoKEggKBBICCAQiABoMCggSBgoCEgAiABACGAAgCg==";
+        Plan result = SubstraitRelUtils.deserializeSubstraitPlan(encodedPlan);
+        System.out.println(result);
+        //assertEquals(originalPlan, result);
     }
 
     @Test
