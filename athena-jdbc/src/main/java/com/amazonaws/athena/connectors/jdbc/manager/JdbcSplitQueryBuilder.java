@@ -112,6 +112,54 @@ public abstract class JdbcSplitQueryBuilder
      * @return prepated statement with SQL. See {@link PreparedStatement}.
      * @throws SQLException JDBC database exception.
      */
+    /**
+     * Holds a SQL string and its associated parameter values for use with ADBC or other non-JDBC execution paths.
+     */
+    public static class SqlComponents
+    {
+        private final String sql;
+        private final List<TypeAndValue> parameters;
+
+        public SqlComponents(String sql, List<TypeAndValue> parameters)
+        {
+            this.sql = sql;
+            this.parameters = parameters;
+        }
+
+        public String getSql()
+        {
+            return sql;
+        }
+
+        public List<TypeAndValue> getParameters()
+        {
+            return parameters;
+        }
+    }
+
+    /**
+     * Builds the SQL string and parameter list without creating a PreparedStatement.
+     * Useful for ADBC and other non-JDBC execution paths.
+     */
+    public SqlComponents buildSqlComponents(
+            final String catalog,
+            final String schema,
+            final String table,
+            final Schema tableSchema,
+            final Constraints constraints,
+            final Split split)
+    {
+        String columnNames = tableSchema.getFields().stream()
+                .map(Field::getName)
+                .filter(c -> !split.getProperties().containsKey(c))
+                .map(this::quote)
+                .collect(Collectors.joining(", "));
+
+        List<TypeAndValue> accumulator = new ArrayList<>();
+        String sql = buildSQLStringLiteral(catalog, schema, table, tableSchema, constraints, split, columnNames, accumulator);
+        return new SqlComponents(sql, accumulator);
+    }
+
     @SuppressFBWarnings("SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING")
     public PreparedStatement buildSql(
             final Connection jdbcConnection,

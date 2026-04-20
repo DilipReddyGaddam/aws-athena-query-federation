@@ -33,6 +33,7 @@
         <surefire.failsafe.version>3.5.4</surefire.failsafe.version>
         <log4j2Version>2.25.4</log4j2Version>
         <apache.arrow.version>18.3.0</apache.arrow.version>
+        <adbc.version>0.23.0</adbc.version>
         <guava.version>33.5.0-jre</guava.version>
         <protobuf3.version>3.25.5</protobuf3.version>
         <antlr.st4.version>4.3.4</antlr.st4.version>
