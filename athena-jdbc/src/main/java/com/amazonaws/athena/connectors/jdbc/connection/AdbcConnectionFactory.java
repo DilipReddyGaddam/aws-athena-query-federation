@@ -24,15 +24,19 @@ import org.apache.arrow.adbc.core.AdbcConnection;
 import org.apache.arrow.adbc.core.AdbcDatabase;
 import org.apache.arrow.adbc.core.AdbcDriver;
 import org.apache.arrow.adbc.core.AdbcException;
-import org.apache.arrow.adbc.core.AdbcStatusCode;
 import org.apache.arrow.adbc.driver.jdbc.JdbcDriver;
+import org.apache.arrow.adbc.driver.jni.JniDriver;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.commons.lang3.Validate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
 import java.util.regex.Matcher;
 
 /**
@@ -104,23 +108,85 @@ public class AdbcConnectionFactory
 
         LOGGER.info("Creating ADBC connection to: {}", derivedJdbcString);
 
-        // Explicitly load the JDBC driver class so it registers with java.sql.DriverManager.
-        // The ADBC JdbcDriver discovers drivers via DriverManager, but unlike HikariCP it does
-        // not call Class.forName() itself. Without this, "No suitable driver found" errors occur.
-        if (driverClassName != null) {
-            try {
-                Class.forName(driverClassName);
-                LOGGER.info("Loaded JDBC driver class: {}", driverClassName);
-            }
-            catch (ClassNotFoundException e) {
-                LOGGER.error("Failed to load JDBC driver class: {}", driverClassName, e);
-                throw new AdbcException("JDBC driver class not found: " + driverClassName,
-                        e, AdbcStatusCode.IO, null, 0);
-            }
-        }
+        loadDriverClass();
 
         JdbcDriver driver = new JdbcDriver(allocator);
         AdbcDatabase database = driver.open(driverOptions);
         return database.connect();
+    }
+
+    /**
+     * Creates a native ADBC connection via JNI to the native PostgreSQL driver.
+     * Requires the native .so to be available (e.g., via Lambda layer at /opt/lib/).
+     */
+    public AdbcConnection getNativeConnection(final CredentialsProvider credentialsProvider,
+            final BufferAllocator allocator, final String nativeDriverPath) throws AdbcException
+    {
+        final String derivedJdbcString;
+        if (credentialsProvider != null) {
+            Matcher secretMatcher = GenericJdbcConnectionFactory.SECRET_NAME_PATTERN
+                    .matcher(databaseConnectionConfig.getJdbcConnectionString());
+            String jdbcUrl = secretMatcher.replaceAll(Matcher.quoteReplacement(""));
+            derivedJdbcString = jdbcUrl.endsWith("?") ? jdbcUrl.substring(0, jdbcUrl.length() - 1) : jdbcUrl;
+        }
+        else {
+            derivedJdbcString = databaseConnectionConfig.getJdbcConnectionString();
+        }
+
+        String pgUri = derivedJdbcString.replace("jdbc:postgresql://", "postgresql://");
+        if (credentialsProvider != null) {
+            Map<String, String> creds = credentialsProvider.getCredentialMap();
+            String user = creds.getOrDefault("user", "");
+            String password = creds.getOrDefault("password", "");
+            pgUri = pgUri.replace("postgresql://", "postgresql://" + user + ":" + password + "@");
+        }
+
+        Map<String, Object> params = new HashMap<>();
+        params.put(JniDriver.PARAM_DRIVER.getKey(), nativeDriverPath);
+        params.put("uri", pgUri);
+
+        LOGGER.info("Creating native ADBC connection via JNI");
+
+        JniDriver driver = new JniDriver(allocator);
+        AdbcDatabase database = driver.open(params);
+        return database.connect();
+    }
+
+    /**
+     * Creates a raw JDBC connection for use with the Arrow JDBC adapter directly.
+     * This bypasses the ADBC layer, allowing custom JdbcToArrowConfig.
+     */
+    public Connection getJdbcConnection(final CredentialsProvider credentialsProvider) throws SQLException
+    {
+        final String derivedJdbcString;
+        Properties connectionProps = new Properties();
+        connectionProps.putAll(jdbcProperties);
+
+        if (credentialsProvider != null) {
+            Matcher secretMatcher = GenericJdbcConnectionFactory.SECRET_NAME_PATTERN
+                    .matcher(databaseConnectionConfig.getJdbcConnectionString());
+            String jdbcUrl = secretMatcher.replaceAll(Matcher.quoteReplacement(""));
+            derivedJdbcString = jdbcUrl.endsWith("?") ? jdbcUrl.substring(0, jdbcUrl.length() - 1) : jdbcUrl;
+            connectionProps.putAll(credentialsProvider.getCredentialMap());
+        }
+        else {
+            derivedJdbcString = databaseConnectionConfig.getJdbcConnectionString();
+        }
+
+        loadDriverClass();
+        LOGGER.info("Creating direct JDBC connection to: {}", derivedJdbcString);
+        return DriverManager.getConnection(derivedJdbcString, connectionProps);
+    }
+
+    private void loadDriverClass()
+    {
+        if (driverClassName != null) {
+            try {
+                Class.forName(driverClassName);
+            }
+            catch (ClassNotFoundException e) {
+                throw new RuntimeException("JDBC driver class not found: " + driverClassName, e);
+            }
+        }
     }
 }

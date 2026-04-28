@@ -33,12 +33,21 @@ import com.amazonaws.athena.connector.lambda.records.RemoteReadRecordsResponse;
 import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
 import com.amazonaws.athena.connectors.jdbc.connection.AdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
+import org.apache.arrow.adapter.jdbc.ArrowVectorIterator;
+import org.apache.arrow.adapter.jdbc.JdbcFieldInfo;
+import org.apache.arrow.adapter.jdbc.JdbcToArrow;
+import org.apache.arrow.adapter.jdbc.JdbcToArrowConfig;
+import org.apache.arrow.adapter.jdbc.JdbcToArrowConfigBuilder;
+import org.apache.arrow.adapter.jdbc.JdbcToArrowUtils;
 import org.apache.arrow.adbc.core.AdbcConnection;
 import org.apache.arrow.adbc.core.AdbcStatement;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.commons.lang3.Validate;
 import org.slf4j.Logger;
@@ -48,19 +57,23 @@ import software.amazon.awssdk.services.athena.AthenaClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.sql.Types;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
 import static com.amazonaws.athena.connector.lambda.handlers.AthenaExceptionFilter.ATHENA_EXCEPTION_FILTER;
 
 /**
- * Abstract ADBC-based record handler that uses Arrow Database Connectivity to fetch data
- * natively as Arrow columnar batches, eliminating the row-by-row JDBC ResultSet to Arrow
- * conversion overhead.
+ * Abstract record handler that uses the Arrow JDBC adapter directly with a custom
+ * {@link JdbcToArrowConfig} for batch-level Arrow data transfer.
  *
- * <p>Overrides {@link RecordHandler#doReadRecords(BlockAllocator, ReadRecordsRequest)} to use
- * {@link AdbcBlockSpiller} for batch-level vector transfers instead of the row-by-row
- * {@link com.amazonaws.athena.connector.lambda.data.S3BlockSpiller} approach.</p>
+ * <p>Uses {@link JdbcToArrow#sqlToArrowVectorIterator(ResultSet, JdbcToArrowConfig)} with
+ * configured {@code arraySubTypesByColumnName} and {@code explicitTypesByColumnName} to handle
+ * database-specific types (arrays, uuid, json, etc.) without SQL workarounds.</p>
  *
  * <p>Subclasses must implement {@link #buildSqlForAdbc(ReadRecordsRequest)} to provide
  * the SQL query string for their specific database.</p>
@@ -72,7 +85,6 @@ public abstract class AdbcRecordHandler
 
     private final AdbcConnectionFactory adbcConnectionFactory;
     private final DatabaseConnectionConfig databaseConnectionConfig;
-    // Stored separately because RecordHandler's fields are private
     private final S3Client s3Client;
     private final AthenaClient athenaClient;
 
@@ -111,22 +123,22 @@ public abstract class AdbcRecordHandler
     }
 
     /**
-     * Overrides the default doReadRecords to use {@link AdbcBlockSpiller} for batch-level
-     * vector transfers instead of the row-by-row S3BlockSpiller approach.
-     *
-     * <p>This method:</p>
-     * <ol>
-     *   <li>Creates an {@link AdbcBlockSpiller} instead of S3BlockSpiller</li>
-     *   <li>Opens an ADBC connection and executes the SQL query</li>
-     *   <li>Writes each Arrow batch directly via {@link AdbcBlockSpiller#writeBatch}</li>
-     *   <li>Returns the appropriate response (inline or spilled)</li>
-     * </ol>
+     * Returns path to native ADBC driver .so. If non-null, uses native driver via JNI.
+     * If null (default), uses Arrow JDBC adapter. Subclasses override to enable native driver.
+     */
+    protected String getNativeDriverPath()
+    {
+        return null;
+    }
+
+    /**
+     * Uses the Arrow JDBC adapter directly with a custom {@link JdbcToArrowConfig}.
      */
     @Override
     public RecordResponse doReadRecords(BlockAllocator allocator, ReadRecordsRequest request)
             throws Exception
     {
-        LOGGER.info("doReadRecords (ADBC batch): {}:{}", request.getSchema(),
+        LOGGER.info("doReadRecords (batch): {}:{}", request.getSchema(),
                 request.getSplit().getSpillLocation());
 
         SpillConfig spillConfig = getSpillConfig(request);
@@ -143,34 +155,22 @@ public abstract class AdbcRecordHandler
                 QueryStatusChecker checker = new QueryStatusChecker(athena, athenaInvoker,
                         request.getQueryId())) {
             String sql = buildSqlForAdbc(request);
-            LOGGER.info("ADBC executing SQL: {}", sql);
+            Map<String, String> partitionValues = request.getSplit().getProperties();
+            String nativeDriverPath = getNativeDriverPath();
 
-            try (BufferAllocator adbcAllocator = new RootAllocator()) {
-                try (AdbcConnection conn = adbcConnectionFactory.getConnection(
-                        getCredentialProvider(getRequestOverrideConfig(request)), adbcAllocator)) {
-                    try (AdbcStatement stmt = conn.createStatement()) {
-                        stmt.setSqlQuery(sql);
-
-                        try (AdbcStatement.QueryResult queryResult = stmt.executeQuery();
-                                ArrowReader reader = queryResult.getReader()) {
-                            Map<String, String> partitionValues = request.getSplit().getProperties();
-                            int totalRows = 0;
-
-                            while (reader.loadNextBatch()) {
-                                if (!checker.isQueryRunning()) {
-                                    LOGGER.info("Query no longer running, stopping ADBC read.");
-                                    break;
-                                }
-
-                                VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-                                LOGGER.debug("ADBC batch received with {} rows", batch.getRowCount());
-                                spiller.writeBatch(batch, partitionValues);
-                                totalRows += batch.getRowCount();
-                            }
-                            LOGGER.info("{} rows returned by database via ADBC batch transfer.", totalRows);
-                        }
-                    }
+            if (nativeDriverPath != null) {
+                try {
+                    LOGGER.info("Native ADBC executing SQL: {}", sql);
+                    executeWithNativeDriver(request, sql, nativeDriverPath, spiller, checker, partitionValues);
                 }
+                catch (NoClassDefFoundError | UnsatisfiedLinkError e) {
+                    LOGGER.warn("Native driver JNI loading failed, falling back to Arrow JDBC: {}", e.getMessage());
+                    executeWithArrowJdbc(request, sql, spiller, checker, partitionValues);
+                }
+            }
+            else {
+                LOGGER.info("Arrow JDBC executing SQL: {}", sql);
+                executeWithArrowJdbc(request, sql, spiller, checker, partitionValues);
             }
 
             if (!spiller.spilled()) {
@@ -183,57 +183,208 @@ public abstract class AdbcRecordHandler
         }
     }
 
+    private void executeWithNativeDriver(ReadRecordsRequest request, String sql, String nativeDriverPath,
+            AdbcBlockSpiller spiller, QueryStatusChecker checker, Map<String, String> partitionValues)
+            throws Exception
+    {
+        try (BufferAllocator adbcAllocator = new RootAllocator();
+                AdbcConnection conn = adbcConnectionFactory.getNativeConnection(
+                        getCredentialProvider(getRequestOverrideConfig(request)), adbcAllocator, nativeDriverPath);
+                AdbcStatement stmt = conn.createStatement()) {
+            stmt.setSqlQuery(sql);
+            AdbcStatement.QueryResult queryResult = stmt.executeQuery();
+            ArrowReader reader = queryResult.getReader();
+            try {
+                int totalRows = 0;
+                while (reader.loadNextBatch()) {
+                    if (!checker.isQueryRunning()) {
+                        LOGGER.info("Query no longer running, stopping read.");
+                        break;
+                    }
+                    VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+                    LOGGER.debug("Native batch: {} rows", batch.getRowCount());
+                    spiller.writeBatch(batch, partitionValues);
+                    totalRows += batch.getRowCount();
+                }
+                LOGGER.info("{} rows via native ADBC.", totalRows);
+            }
+            finally {
+                // Close only the reader; QueryResult.close() would try to close the
+                // reader again, causing "ArrowArrayStream is already closed" on the
+                // native C stream. The reader close releases all underlying resources.
+                try {
+                    reader.close();
+                }
+                catch (Exception e) {
+                    LOGGER.warn("Error closing ArrowReader (expected for native driver): {}", e.getMessage());
+                }
+            }
+        }
+    }
+
+    private void executeWithArrowJdbc(ReadRecordsRequest request, String sql,
+            AdbcBlockSpiller spiller, QueryStatusChecker checker, Map<String, String> partitionValues)
+            throws Exception
+    {
+        try (BufferAllocator arrowAllocator = new RootAllocator();
+                Connection jdbcConn = adbcConnectionFactory.getJdbcConnection(
+                        getCredentialProvider(getRequestOverrideConfig(request)))) {
+            JdbcToArrowConfig arrowConfig = buildArrowConfig(arrowAllocator, request.getSchema(),
+                    request.getSplit().getProperties());
+            try (Statement stmt = jdbcConn.createStatement(
+                    ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+                    ResultSet rs = stmt.executeQuery(sql);
+                    ArrowVectorIterator iterator = JdbcToArrow.sqlToArrowVectorIterator(rs, arrowConfig)) {
+                int totalRows = 0;
+                while (iterator.hasNext()) {
+                    if (!checker.isQueryRunning()) {
+                        LOGGER.info("Query no longer running, stopping read.");
+                        break;
+                    }
+                    try (VectorSchemaRoot batch = iterator.next()) {
+                        LOGGER.debug("Batch received with {} rows", batch.getRowCount());
+                        spiller.writeBatch(batch, partitionValues);
+                        totalRows += batch.getRowCount();
+                    }
+                }
+                LOGGER.info("{} rows returned via Arrow JDBC batch transfer.", totalRows);
+            }
+        }
+    }
+
     /**
-     * Fallback row-by-row implementation. This is not called when {@link #doReadRecords} is
-     * used (which creates its own AdbcBlockSpiller), but is kept for interface compatibility.
+     * Fallback row-by-row implementation kept for interface compatibility.
      */
     @Override
     public void readWithConstraint(BlockSpiller blockSpiller, ReadRecordsRequest readRecordsRequest,
             QueryStatusChecker queryStatusChecker) throws Exception
     {
-        LOGGER.info("{}: ADBC fallback readWithConstraint: {}, table {}", readRecordsRequest.getQueryId(),
+        LOGGER.info("{}: Arrow JDBC fallback readWithConstraint: {}, table {}", readRecordsRequest.getQueryId(),
                 readRecordsRequest.getCatalogName(), readRecordsRequest.getTableName());
 
         String sql = buildSqlForAdbc(readRecordsRequest);
-        LOGGER.info("ADBC executing SQL: {}", sql);
+        LOGGER.info("Arrow JDBC executing SQL: {}", sql);
 
-        try (BufferAllocator adbcAllocator = new RootAllocator()) {
-            try (AdbcConnection adbcConnection = adbcConnectionFactory.getConnection(
-                    getCredentialProvider(getRequestOverrideConfig(readRecordsRequest)), adbcAllocator)) {
-                try (AdbcStatement stmt = adbcConnection.createStatement()) {
-                    stmt.setSqlQuery(sql);
+        try (BufferAllocator arrowAllocator = new RootAllocator();
+                Connection jdbcConn = adbcConnectionFactory.getJdbcConnection(
+                        getCredentialProvider(getRequestOverrideConfig(readRecordsRequest)))) {
+            JdbcToArrowConfig arrowConfig = buildArrowConfig(arrowAllocator, readRecordsRequest.getSchema(),
+                    readRecordsRequest.getSplit().getProperties());
 
-                    try (AdbcStatement.QueryResult queryResult = stmt.executeQuery();
-                            ArrowReader reader = queryResult.getReader()) {
-                        Schema expectedSchema = readRecordsRequest.getSchema();
-                        Map<String, String> partitionValues = readRecordsRequest.getSplit().getProperties();
+            try (Statement stmt = jdbcConn.createStatement(
+                    ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+                    ResultSet rs = stmt.executeQuery(sql);
+                    ArrowVectorIterator iterator = JdbcToArrow.sqlToArrowVectorIterator(rs, arrowConfig)) {
+                Schema expectedSchema = readRecordsRequest.getSchema();
+                Map<String, String> partitionValues = readRecordsRequest.getSplit().getProperties();
 
-                        int totalRows = 0;
-                        while (reader.loadNextBatch()) {
-                            if (!queryStatusChecker.isQueryRunning()) {
-                                LOGGER.info("Query no longer running, stopping ADBC read.");
-                                return;
-                            }
+                int totalRows = 0;
+                while (iterator.hasNext()) {
+                    if (!queryStatusChecker.isQueryRunning()) {
+                        LOGGER.info("Query no longer running, stopping read.");
+                        return;
+                    }
 
-                            VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-                            int batchRowCount = batch.getRowCount();
-                            LOGGER.debug("ADBC batch received with {} rows", batchRowCount);
-
-                            // If spiller is an AdbcBlockSpiller, use batch path
-                            if (blockSpiller instanceof AdbcBlockSpiller) {
-                                ((AdbcBlockSpiller) blockSpiller).writeBatch(batch, partitionValues);
-                            }
-                            else {
-                                writeRowByRow(batch, blockSpiller, expectedSchema, partitionValues,
-                                        queryStatusChecker);
-                            }
-                            totalRows += batchRowCount;
+                    try (VectorSchemaRoot batch = iterator.next()) {
+                        LOGGER.debug("Batch received with {} rows", batch.getRowCount());
+                        if (blockSpiller instanceof AdbcBlockSpiller) {
+                            ((AdbcBlockSpiller) blockSpiller).writeBatch(batch, partitionValues);
                         }
-                        LOGGER.info("{} rows returned by database via ADBC.", totalRows);
+                        else {
+                            writeRowByRow(batch, blockSpiller, expectedSchema, partitionValues,
+                                    queryStatusChecker);
+                        }
+                        totalRows += batch.getRowCount();
                     }
                 }
+                LOGGER.info("{} rows returned via Arrow JDBC.", totalRows);
             }
         }
+    }
+
+    /**
+     * Builds a {@link JdbcToArrowConfig} with type mappings derived from the request schema.
+     * <ul>
+     *   <li>List fields → arraySubTypesByColumnName (maps column to its element JDBC type)</li>
+     *   <li>Utf8 fields → explicitTypesByColumnName as VARCHAR (handles uuid/json/jsonb mapped to Utf8)</li>
+     * </ul>
+     * Subclasses can override to add database-specific mappings.
+     */
+    protected JdbcToArrowConfig buildArrowConfig(BufferAllocator allocator, Schema schema,
+            Map<String, String> partitionColumns)
+    {
+        Map<String, JdbcFieldInfo> arraySubTypes = new HashMap<>();
+        Map<String, JdbcFieldInfo> explicitTypes = new HashMap<>();
+
+        for (Field field : schema.getFields()) {
+            if (partitionColumns.containsKey(field.getName())) {
+                continue;
+            }
+            ArrowType type = field.getType();
+            if (type.getTypeID() == ArrowType.ArrowTypeID.List && !field.getChildren().isEmpty()) {
+                ArrowType childType = field.getChildren().get(0).getType();
+                int jdbcType = arrowTypeToJdbcType(childType);
+                arraySubTypes.put(field.getName(), new JdbcFieldInfo(jdbcType));
+                LOGGER.debug("Array sub-type mapping: {} -> JDBC type {}", field.getName(), jdbcType);
+            }
+            else if (type.getTypeID() == ArrowType.ArrowTypeID.Utf8) {
+                // Map Utf8 columns explicitly as VARCHAR to handle Types.OTHER (uuid, json, etc.)
+                explicitTypes.put(field.getName(), new JdbcFieldInfo(Types.VARCHAR));
+            }
+        }
+
+        JdbcToArrowConfigBuilder builder = new JdbcToArrowConfigBuilder()
+                .setAllocator(allocator)
+                .setCalendar(JdbcToArrowUtils.getUtcCalendar())
+                .setTargetBatchSize(1024);
+
+        if (!arraySubTypes.isEmpty()) {
+            builder.setArraySubTypeByColumnNameMap(arraySubTypes);
+            LOGGER.info("Configured {} array sub-type mappings", arraySubTypes.size());
+        }
+        if (!explicitTypes.isEmpty()) {
+            builder.setExplicitTypesByColumnName(explicitTypes);
+            LOGGER.info("Configured {} explicit type mappings for Utf8 columns", explicitTypes.size());
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Maps an Arrow type to the corresponding java.sql.Types constant.
+     */
+    protected static int arrowTypeToJdbcType(ArrowType arrowType)
+    {
+        if (arrowType instanceof ArrowType.Bool) {
+            return Types.BOOLEAN;
+        }
+        else if (arrowType instanceof ArrowType.Int) {
+            int bitWidth = ((ArrowType.Int) arrowType).getBitWidth();
+            if (bitWidth <= 16) {
+                return Types.SMALLINT;
+            }
+            else if (bitWidth <= 32) {
+                return Types.INTEGER;
+            }
+            return Types.BIGINT;
+        }
+        else if (arrowType instanceof ArrowType.FloatingPoint) {
+            FloatingPointPrecision precision = ((ArrowType.FloatingPoint) arrowType).getPrecision();
+            return precision == FloatingPointPrecision.SINGLE ? Types.REAL : Types.DOUBLE;
+        }
+        else if (arrowType instanceof ArrowType.Decimal) {
+            return Types.DECIMAL;
+        }
+        else if (arrowType instanceof ArrowType.Date) {
+            return Types.DATE;
+        }
+        else if (arrowType instanceof ArrowType.Timestamp) {
+            return Types.TIMESTAMP;
+        }
+        else if (arrowType instanceof ArrowType.Binary || arrowType instanceof ArrowType.LargeBinary) {
+            return Types.BINARY;
+        }
+        return Types.VARCHAR;
     }
 
     /**
@@ -252,7 +403,7 @@ public abstract class AdbcRecordHandler
             final int currentRow = row;
             spiller.writeRows((com.amazonaws.athena.connector.lambda.data.Block block, int rowNum) -> {
                 boolean matched = true;
-                for (org.apache.arrow.vector.types.pojo.Field field : expectedSchema.getFields()) {
+                for (Field field : expectedSchema.getFields()) {
                     String fieldName = field.getName();
 
                     if (partitionValues.containsKey(fieldName)) {
@@ -272,11 +423,8 @@ public abstract class AdbcRecordHandler
     }
 
     /**
-     * Builds the SQL query string for ADBC execution.
+     * Builds the SQL query string for execution.
      * Subclasses should use their database-specific query builder to generate the SQL.
-     *
-     * @param request the read records request containing table, schema, constraints, and split info
-     * @return SQL string to execute via ADBC
      */
     protected abstract String buildSqlForAdbc(ReadRecordsRequest request);
 }

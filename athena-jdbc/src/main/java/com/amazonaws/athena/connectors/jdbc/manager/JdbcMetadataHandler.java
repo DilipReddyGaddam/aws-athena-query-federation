@@ -479,11 +479,14 @@ public abstract class JdbcMetadataHandler
 
     protected List<String> getSplitClauses(final TableName tableName)
     {
+        return getSplitClauses(tableName, null);
+    }
+
+    protected List<String> getSplitClauses(final TableName tableName, final GetSplitsRequest getSplitsRequest)
+    {
         List<String> splitClauses = new ArrayList<>();
-        // getSplitClauses is only used by PostgreSQL connector as of now,
-        // and it does not require AwsRequestOverrideConfiguration for FAS_TOKEN query federation.
-        // So keep it as is.
-        try (Connection jdbcConnection = getJdbcConnectionFactory().getConnection(getCredentialProvider());
+        try (Connection jdbcConnection = getJdbcConnectionFactory().getConnection(
+                getCredentialProvider(getSplitsRequest != null ? getRequestOverrideConfig(getSplitsRequest) : null));
                 ResultSet resultSet = jdbcConnection.getMetaData().getPrimaryKeys(null, tableName.getSchemaName(), tableName.getTableName())) {
             List<String> primaryKeyColumns = new ArrayList<>();
             while (resultSet.next()) {

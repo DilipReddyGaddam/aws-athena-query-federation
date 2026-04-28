@@ -24,6 +24,7 @@ import com.amazonaws.athena.connector.lambda.data.BlockAllocator;
 import com.amazonaws.athena.connector.lambda.data.BlockSpiller;
 import com.amazonaws.athena.connector.lambda.data.BlockUtils;
 import com.amazonaws.athena.connector.lambda.data.BlockWriter;
+import com.amazonaws.athena.connector.lambda.data.FieldResolver;
 import com.amazonaws.athena.connector.lambda.data.SpillConfig;
 import com.amazonaws.athena.connector.lambda.domain.predicate.ConstraintEvaluator;
 import com.amazonaws.athena.connector.lambda.domain.spill.S3SpillLocation;
@@ -32,8 +33,10 @@ import com.amazonaws.athena.connector.lambda.security.AesGcmBlockCrypto;
 import com.amazonaws.athena.connector.lambda.security.BlockCrypto;
 import com.amazonaws.athena.connector.lambda.security.EncryptionKey;
 import com.amazonaws.athena.connector.lambda.security.NoOpBlockCrypto;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
@@ -42,6 +45,8 @@ import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -150,13 +155,38 @@ public class AdbcBlockSpiller
                         }
                     }
                     else {
-                        // Safe path: types differ (e.g., DB returns BIGINT, schema expects INT)
-                        // Fall back to getObject() + BlockUtils.setValue() for type coercion
+                        // Safe path: types differ (e.g., native driver returns Decimal256 for numeric,
+                        // or text for arrays/uuid). Fall back to getObject() + type-specific handling.
                         LOGGER.debug("Type mismatch for field '{}': source={}, target={}. Using coercion path.",
                                 fieldName, sourceVector.getMinorType(), targetVector.getMinorType());
+                        boolean targetIsList = field.getType().getTypeID() == ArrowType.ArrowTypeID.List;
+                        boolean targetIsDecimal = targetVector instanceof DecimalVector;
                         for (int i = 0; i < batchRows; i++) {
                             Object value = sourceVector.isNull(i) ? null : sourceVector.getObject(i);
-                            BlockUtils.setValue(targetVector, blockOffset + i, value);
+                            if (value == null) {
+                                BlockUtils.setValue(targetVector, blockOffset + i, null);
+                            }
+                            else if (targetIsDecimal) {
+                                // Native ADBC driver returns Decimal256 for PostgreSQL numeric;
+                                // target expects Decimal128. Convert via BigDecimal with correct scale.
+                                DecimalVector dv = (DecimalVector) targetVector;
+                                BigDecimal bd = (value instanceof BigDecimal)
+                                        ? (BigDecimal) value
+                                        : new BigDecimal(value.toString());
+                                dv.setSafe(blockOffset + i, bd.setScale(dv.getScale(), RoundingMode.HALF_UP));
+                            }
+                            else if (targetIsList && value instanceof org.apache.arrow.vector.util.Text) {
+                                value = parsePostgresArray(((org.apache.arrow.vector.util.Text) value).toString());
+                                BlockUtils.setComplexValue(targetVector, blockOffset + i,
+                                        FieldResolver.DEFAULT, value);
+                            }
+                            else if (targetIsList) {
+                                BlockUtils.setComplexValue(targetVector, blockOffset + i,
+                                        FieldResolver.DEFAULT, value);
+                            }
+                            else {
+                                BlockUtils.setValue(targetVector, blockOffset + i, value);
+                            }
                         }
                     }
                 }
@@ -244,7 +274,6 @@ public class AdbcBlockSpiller
     {
         if (currentBlock == null) {
             currentBlock = allocator.createBlock(schema);
-            currentBlock.constrain(constraintEvaluator);
         }
     }
 
@@ -284,5 +313,24 @@ public class AdbcBlockSpiller
         S3SpillLocation splitSpillLocation = (S3SpillLocation) spillConfig.getSpillLocation();
         String blockKey = splitSpillLocation.getKey() + "." + spillNumber.getAndIncrement();
         return new S3SpillLocation(splitSpillLocation.getBucket(), blockKey, false);
+    }
+
+    /**
+     * Parses a PostgreSQL array text representation (e.g., "{food,bar,baz}") into a List of strings.
+     */
+    private static List<String> parsePostgresArray(String pgArray)
+    {
+        List<String> result = new ArrayList<>();
+        if (pgArray == null || pgArray.equals("{}") || pgArray.equals("{NULL}")) {
+            return result;
+        }
+        // Strip outer braces
+        String inner = pgArray.substring(1, pgArray.length() - 1);
+        if (!inner.isEmpty()) {
+            for (String element : inner.split(",")) {
+                result.add(element.trim());
+            }
+        }
+        return result;
     }
 }

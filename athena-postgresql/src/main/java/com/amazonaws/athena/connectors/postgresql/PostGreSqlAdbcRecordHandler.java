@@ -20,6 +20,7 @@
 package com.amazonaws.athena.connectors.postgresql;
 
 import com.amazonaws.athena.connector.lambda.records.ReadRecordsRequest;
+import com.amazonaws.athena.connector.substrait.SubstraitSqlUtils;
 import com.amazonaws.athena.connectors.jdbc.connection.AdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionInfo;
@@ -31,6 +32,8 @@ import com.amazonaws.athena.connectors.jdbc.qpt.JdbcQueryPassthrough;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.dialect.PostgresqlSqlDialect;
 import org.apache.commons.lang3.Validate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,8 +57,8 @@ import static com.amazonaws.athena.connectors.postgresql.PostGreSqlConstants.POS
 import static com.amazonaws.athena.connectors.postgresql.PostGreSqlConstants.POSTGRES_QUOTE_CHARACTER;
 
 /**
- * PostgreSQL record handler using ADBC (Arrow Database Connectivity) for native Arrow columnar data retrieval.
- * This eliminates the row-by-row JDBC ResultSet to Arrow conversion overhead.
+ * PostgreSQL record handler using the Arrow JDBC adapter directly for native Arrow columnar
+ * data retrieval with custom JdbcToArrowConfig type mappings.
  */
 public class PostGreSqlAdbcRecordHandler
         extends AdbcRecordHandler
@@ -94,12 +97,44 @@ public class PostGreSqlAdbcRecordHandler
         this.jdbcSplitQueryBuilder = Validate.notNull(jdbcSplitQueryBuilder, "query builder must not be null");
     }
 
+    private static final String NATIVE_DRIVER_PATH = "/opt/lib/libadbc_driver_postgresql.so";
+
+    @Override
+    protected String getNativeDriverPath()
+    {
+        if (new java.io.File(NATIVE_DRIVER_PATH).exists()) {
+            LOGGER.info("Native ADBC driver found at {}", NATIVE_DRIVER_PATH);
+            return NATIVE_DRIVER_PATH;
+        }
+        LOGGER.info("Native ADBC driver not found, using Arrow JDBC adapter");
+        return null;
+    }
+
     @Override
     protected String buildSqlForAdbc(ReadRecordsRequest request)
     {
         if (request.getConstraints().isQueryPassThrough()) {
             queryPassthrough.verify(request.getConstraints().getQueryPassthroughArguments());
             return request.getConstraints().getQueryPassthroughArguments().get(JdbcQueryPassthrough.QUERY);
+        }
+
+        if (request.getConstraints().getQueryPlan() != null
+                && request.getConstraints().getQueryPlan().getSubstraitPlan() != null) {
+            String plan = request.getConstraints().getQueryPlan().getSubstraitPlan();
+            SqlNode sqlNode = SubstraitSqlUtils.getSqlNodeFromSubstraitPlan(plan, PostgresqlSqlDialect.DEFAULT);
+            String sql = sqlNode.toSqlString(PostgresqlSqlDialect.DEFAULT).getSql();
+
+            // Append split range clause if present
+            String partitionSchemaName = request.getSplit().getProperty("partition_schema_name");
+            String partitionName = request.getSplit().getProperty("partition_name");
+            if ("*".equals(partitionSchemaName) && partitionName != null && !"*".equals(partitionName)) {
+                sql = sql.toUpperCase().contains("WHERE")
+                        ? sql + " AND " + partitionName
+                        : sql + " WHERE " + partitionName;
+            }
+
+            LOGGER.info("QueryPlan SQL: {}", sql);
+            return sql;
         }
 
         JdbcSplitQueryBuilder.SqlComponents components = jdbcSplitQueryBuilder.buildSqlComponents(
@@ -115,7 +150,7 @@ public class PostGreSqlAdbcRecordHandler
 
     /**
      * Replaces '?' placeholders in the SQL string with actual parameter values.
-     * This is a POC approach; production code should use ADBC's bind(VectorSchemaRoot) API.
+     * This is a POC approach; production code should use prepared statement parameter binding.
      */
     static String inlineParameters(String sql, List<TypeAndValue> params)
     {
@@ -157,7 +192,6 @@ public class PostGreSqlAdbcRecordHandler
             case DECIMAL:
                 return ((BigDecimal) value).toPlainString();
             case VARCHAR:
-                // Escape single quotes for SQL injection safety
                 return "'" + String.valueOf(value).replace("'", "''") + "'";
             case VARBINARY:
                 byte[] bytes = (byte[]) value;

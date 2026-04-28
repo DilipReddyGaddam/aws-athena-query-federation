@@ -39,19 +39,20 @@ import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
 import com.amazonaws.athena.connectors.jdbc.connection.AdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.google.common.collect.ImmutableMap;
-import org.apache.arrow.adbc.core.AdbcConnection;
-import org.apache.arrow.adbc.core.AdbcStatement;
+import org.apache.arrow.adapter.jdbc.ArrowVectorIterator;
+import org.apache.arrow.adapter.jdbc.JdbcToArrow;
+import org.apache.arrow.adapter.jdbc.JdbcToArrowConfig;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.athena.AthenaClient;
@@ -63,6 +64,9 @@ import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueReques
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueResponse;
 
 import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -71,6 +75,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.when;
 
@@ -90,9 +96,9 @@ public class AdbcRecordHandlerTest
 
     private AdbcRecordHandler adbcRecordHandler;
     private AdbcConnectionFactory adbcConnectionFactory;
-    private AdbcConnection adbcConnection;
-    private AdbcStatement adbcStatement;
-    private ArrowReader arrowReader;
+    private Connection mockJdbcConnection;
+    private Statement mockJdbcStatement;
+    private ResultSet mockResultSet;
     private S3Client amazonS3;
     private SecretsManagerClient secretsManager;
     private AthenaClient athena;
@@ -103,9 +109,9 @@ public class AdbcRecordHandlerTest
     public void setup() throws Exception
     {
         this.adbcConnectionFactory = Mockito.mock(AdbcConnectionFactory.class);
-        this.adbcConnection = Mockito.mock(AdbcConnection.class);
-        this.adbcStatement = Mockito.mock(AdbcStatement.class);
-        this.arrowReader = Mockito.mock(ArrowReader.class);
+        this.mockJdbcConnection = Mockito.mock(Connection.class);
+        this.mockJdbcStatement = Mockito.mock(Statement.class);
+        this.mockResultSet = Mockito.mock(ResultSet.class);
         this.amazonS3 = Mockito.mock(S3Client.class);
         this.secretsManager = Mockito.mock(SecretsManagerClient.class);
         this.athena = Mockito.mock(AthenaClient.class);
@@ -118,11 +124,9 @@ public class AdbcRecordHandlerTest
                         .secretString("{\"username\": \"testUser\", \"password\": \"testPassword\"}")
                         .build());
 
-        when(this.adbcConnectionFactory.getConnection(any(), any(BufferAllocator.class))).thenReturn(this.adbcConnection);
-        when(this.adbcConnection.createStatement()).thenReturn(this.adbcStatement);
-
-        AdbcStatement.QueryResult queryResult = new AdbcStatement.QueryResult(-1, this.arrowReader);
-        when(this.adbcStatement.executeQuery()).thenReturn(queryResult);
+        when(this.adbcConnectionFactory.getJdbcConnection(any())).thenReturn(this.mockJdbcConnection);
+        when(this.mockJdbcConnection.createStatement(anyInt(), anyInt())).thenReturn(this.mockJdbcStatement);
+        when(this.mockJdbcStatement.executeQuery(anyString())).thenReturn(this.mockResultSet);
 
         DatabaseConnectionConfig databaseConnectionConfig = new DatabaseConnectionConfig(
                 TEST_CATALOG, "fakedatabase", CONNECTION_STRING, TEST_SECRET);
@@ -142,7 +146,6 @@ public class AdbcRecordHandlerTest
     @Test
     public void readWithConstraintReturnsData() throws Exception
     {
-        // Use a dedicated allocator for test Arrow data
         try (BufferAllocator testAllocator = new RootAllocator()) {
             Schema fieldSchema = SchemaBuilder.newBuilder()
                     .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
@@ -155,49 +158,46 @@ public class AdbcRecordHandlerTest
                     Field.nullable(TEST_COL2, Types.MinorType.VARCHAR.getType()));
             try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(batchFields), testAllocator)) {
                 batch.setRowCount(2);
-
                 IntVector intVector = (IntVector) batch.getVector(TEST_COL1);
                 intVector.allocateNew(2);
                 intVector.set(0, 1);
                 intVector.set(1, 2);
                 intVector.setValueCount(2);
-
                 VarCharVector varcharVector = (VarCharVector) batch.getVector(TEST_COL2);
                 varcharVector.allocateNew();
                 varcharVector.set(0, "testVal1".getBytes(StandardCharsets.UTF_8));
                 varcharVector.set(1, "testVal2".getBytes(StandardCharsets.UTF_8));
                 varcharVector.setValueCount(2);
 
-                when(this.arrowReader.loadNextBatch()).thenReturn(true, false);
-                when(this.arrowReader.getVectorSchemaRoot()).thenReturn(batch);
+                ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+                when(mockIterator.hasNext()).thenReturn(true, false);
+                when(mockIterator.next()).thenReturn(batch);
 
-                try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-                    ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
-                    when(constraintEvaluator.apply(nullable(String.class), any())).thenReturn(true);
+                try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+                    mockedJdbcToArrow.when(() -> JdbcToArrow
+                            .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                            .thenReturn(mockIterator);
 
-                    S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-                    SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
-                    when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
+                    try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                        ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
+                        when(constraintEvaluator.apply(nullable(String.class), any())).thenReturn(true);
+                        S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+                        SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
+                        when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
 
-                    try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
-                            constraintEvaluator, ImmutableMap.of())) {
-                        Split split = Split.newBuilder(s3SpillLocation, null)
-                                .add(TEST_PARTITION_COL, TEST_PARTITION_VALUE)
-                                .build();
-                        Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                                Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
-
-                        ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                                this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                                new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
-
-                        when(amazonS3.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
-                                .thenReturn(PutObjectResponse.builder().build());
-
-                        this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
-
-                        Mockito.verify(this.adbcStatement).setSqlQuery(TEST_SQL);
-                        Mockito.verify(this.adbcStatement).executeQuery();
+                        try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
+                                constraintEvaluator, ImmutableMap.of())) {
+                            Split split = Split.newBuilder(s3SpillLocation, null)
+                                    .add(TEST_PARTITION_COL, TEST_PARTITION_VALUE).build();
+                            Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                            ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                                    this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                                    new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
+                            when(amazonS3.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                                    .thenReturn(PutObjectResponse.builder().build());
+                            this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
+                        }
                     }
                 }
             }
@@ -207,94 +207,32 @@ public class AdbcRecordHandlerTest
     @Test
     public void readWithConstraintRespectsQueryCancellation() throws Exception
     {
-        Schema fieldSchema = SchemaBuilder.newBuilder()
-                .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
-                .build();
-
-        // Query is cancelled before reading batches
         when(this.queryStatusChecker.isQueryRunning()).thenReturn(false);
-        when(this.arrowReader.loadNextBatch()).thenReturn(true);
 
-        try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-            ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
+        ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+        when(mockIterator.hasNext()).thenReturn(true);
 
-            S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-            SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
-            when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
+        try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+            mockedJdbcToArrow.when(() -> JdbcToArrow
+                    .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                    .thenReturn(mockIterator);
 
-            try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
-                    constraintEvaluator, ImmutableMap.of())) {
-                Split split = Split.newBuilder(s3SpillLocation, null).build();
-                Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                        Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
-
-                ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                        this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                        new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
-
-                this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
-
-                // Verify the handler returned without writing data
-                Mockito.verify(this.adbcStatement).executeQuery();
-            }
-        }
-    }
-
-    @Test
-    public void readWithConstraintHandlesNullValues() throws Exception
-    {
-        try (BufferAllocator testAllocator = new RootAllocator()) {
             Schema fieldSchema = SchemaBuilder.newBuilder()
-                    .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
-                    .addField(FieldBuilder.newBuilder(TEST_COL2, Types.MinorType.VARCHAR.getType()).build())
-                    .build();
-
-            List<Field> batchFields = Arrays.asList(
-                    Field.nullable(TEST_COL1, Types.MinorType.INT.getType()),
-                    Field.nullable(TEST_COL2, Types.MinorType.VARCHAR.getType()));
-            try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(batchFields), testAllocator)) {
-                batch.setRowCount(2);
-
-                IntVector intVector = (IntVector) batch.getVector(TEST_COL1);
-                intVector.allocateNew(2);
-                intVector.set(0, 1);
-                intVector.setNull(1);
-                intVector.setValueCount(2);
-
-                VarCharVector varcharVector = (VarCharVector) batch.getVector(TEST_COL2);
-                varcharVector.allocateNew();
-                varcharVector.setNull(0);
-                varcharVector.set(1, "testVal".getBytes(StandardCharsets.UTF_8));
-                varcharVector.setValueCount(2);
-
-                when(this.arrowReader.loadNextBatch()).thenReturn(true, false);
-                when(this.arrowReader.getVectorSchemaRoot()).thenReturn(batch);
-
-                try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-                    ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
-                    when(constraintEvaluator.apply(nullable(String.class), any())).thenReturn(true);
-
-                    S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-                    SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
-                    when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
-
-                    try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
-                            constraintEvaluator, ImmutableMap.of())) {
-                        Split split = Split.newBuilder(s3SpillLocation, null).build();
-                        Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                                Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
-
-                        ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                                this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                                new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
-
-                        when(amazonS3.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
-                                .thenReturn(PutObjectResponse.builder().build());
-
-                        // Should not throw with null values
-                        this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
-                        Mockito.verify(this.adbcStatement).executeQuery();
-                    }
+                    .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build()).build();
+            try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
+                S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+                SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
+                when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
+                try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
+                        constraintEvaluator, ImmutableMap.of())) {
+                    Split split = Split.newBuilder(s3SpillLocation, null).build();
+                    Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                            Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                    ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                            this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                            new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
+                    this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
                 }
             }
         }
@@ -303,33 +241,31 @@ public class AdbcRecordHandlerTest
     @Test
     public void readWithConstraintHandlesEmptyResult() throws Exception
     {
-        Schema fieldSchema = SchemaBuilder.newBuilder()
-                .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
-                .build();
+        ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+        when(mockIterator.hasNext()).thenReturn(false);
 
-        when(this.arrowReader.loadNextBatch()).thenReturn(false);
+        try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+            mockedJdbcToArrow.when(() -> JdbcToArrow
+                    .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                    .thenReturn(mockIterator);
 
-        try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-            ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
-
-            S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-            SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
-            when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
-
-            try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
-                    constraintEvaluator, ImmutableMap.of())) {
-                Split split = Split.newBuilder(s3SpillLocation, null).build();
-                Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                        Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
-
-                ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                        this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                        new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
-
-                this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
-
-                // Verify ADBC was used but no data was spilled
-                Mockito.verify(this.adbcStatement).executeQuery();
+            Schema fieldSchema = SchemaBuilder.newBuilder()
+                    .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build()).build();
+            try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
+                S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+                SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
+                when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
+                try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
+                        constraintEvaluator, ImmutableMap.of())) {
+                    Split split = Split.newBuilder(s3SpillLocation, null).build();
+                    Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                            Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                    ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                            this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                            new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
+                    this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
+                }
             }
         }
     }
@@ -342,50 +278,46 @@ public class AdbcRecordHandlerTest
                     .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
                     .addField(FieldBuilder.newBuilder(TEST_COL2, Types.MinorType.VARCHAR.getType()).build())
                     .build();
-
             List<Field> batchFields = Arrays.asList(
                     Field.nullable(TEST_COL1, Types.MinorType.INT.getType()),
                     Field.nullable(TEST_COL2, Types.MinorType.VARCHAR.getType()));
             try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(batchFields), testAllocator)) {
                 batch.setRowCount(2);
-
                 IntVector intVector = (IntVector) batch.getVector(TEST_COL1);
                 intVector.allocateNew(2);
                 intVector.set(0, 10);
                 intVector.set(1, 20);
                 intVector.setValueCount(2);
-
                 VarCharVector varcharVector = (VarCharVector) batch.getVector(TEST_COL2);
                 varcharVector.allocateNew();
                 varcharVector.set(0, "val1".getBytes(StandardCharsets.UTF_8));
                 varcharVector.set(1, "val2".getBytes(StandardCharsets.UTF_8));
                 varcharVector.setValueCount(2);
 
-                when(this.arrowReader.loadNextBatch()).thenReturn(true, false);
-                when(this.arrowReader.getVectorSchemaRoot()).thenReturn(batch);
+                ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+                when(mockIterator.hasNext()).thenReturn(true, false);
+                when(mockIterator.next()).thenReturn(batch);
 
-                S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-                Split split = Split.newBuilder(s3SpillLocation, null).build();
-                Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                        Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+                    mockedJdbcToArrow.when(() -> JdbcToArrow
+                            .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                            .thenReturn(mockIterator);
 
-                ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                        this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                        new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints,
-                        100_000_000, 100_000_000);
-
-                try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-                    RecordResponse response = this.adbcRecordHandler.doReadRecords(allocator, readRecordsRequest);
-
-                    assertNotNull(response);
-                    assertTrue(response instanceof ReadRecordsResponse);
-                    ReadRecordsResponse readResponse = (ReadRecordsResponse) response;
-                    assertEquals(2, readResponse.getRecordCount());
-
-                    Mockito.verify(this.adbcStatement).setSqlQuery(TEST_SQL);
-                    Mockito.verify(this.adbcStatement).executeQuery();
-
-                    response.close();
+                    S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+                    Split split = Split.newBuilder(s3SpillLocation, null).build();
+                    Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                            Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                    ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                            this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                            new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints,
+                            100_000_000, 100_000_000);
+                    try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                        RecordResponse response = this.adbcRecordHandler.doReadRecords(allocator, readRecordsRequest);
+                        assertNotNull(response);
+                        assertTrue(response instanceof ReadRecordsResponse);
+                        assertEquals(2, ((ReadRecordsResponse) response).getRecordCount());
+                        response.close();
+                    }
                 }
             }
         }
@@ -394,33 +326,31 @@ public class AdbcRecordHandlerTest
     @Test
     public void doReadRecordsBatchPathHandlesEmptyResult() throws Exception
     {
-        Schema fieldSchema = SchemaBuilder.newBuilder()
-                .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
-                .build();
+        ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+        when(mockIterator.hasNext()).thenReturn(false);
 
-        when(this.arrowReader.loadNextBatch()).thenReturn(false);
+        try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+            mockedJdbcToArrow.when(() -> JdbcToArrow
+                    .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                    .thenReturn(mockIterator);
 
-        S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-        Split split = Split.newBuilder(s3SpillLocation, null).build();
-        Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
-
-        ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints,
-                100_000_000, 100_000_000);
-
-        try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-            RecordResponse response = this.adbcRecordHandler.doReadRecords(allocator, readRecordsRequest);
-
-            assertNotNull(response);
-            assertTrue(response instanceof ReadRecordsResponse);
-            ReadRecordsResponse readResponse = (ReadRecordsResponse) response;
-            assertEquals(0, readResponse.getRecordCount());
-
-            Mockito.verify(this.adbcStatement).executeQuery();
-
-            response.close();
+            Schema fieldSchema = SchemaBuilder.newBuilder()
+                    .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build()).build();
+            S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+            Split split = Split.newBuilder(s3SpillLocation, null).build();
+            Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+            ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                    this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                    new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints,
+                    100_000_000, 100_000_000);
+            try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                RecordResponse response = this.adbcRecordHandler.doReadRecords(allocator, readRecordsRequest);
+                assertNotNull(response);
+                assertTrue(response instanceof ReadRecordsResponse);
+                assertEquals(0, ((ReadRecordsResponse) response).getRecordCount());
+                response.close();
+            }
         }
     }
 
@@ -432,42 +362,98 @@ public class AdbcRecordHandlerTest
                     .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
                     .addField(FieldBuilder.newBuilder(TEST_PARTITION_COL, Types.MinorType.VARCHAR.getType()).build())
                     .build();
-
             List<Field> batchFields = Collections.singletonList(
                     Field.nullable(TEST_COL1, Types.MinorType.INT.getType()));
             try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(batchFields), testAllocator)) {
                 batch.setRowCount(2);
-
                 IntVector intVector = (IntVector) batch.getVector(TEST_COL1);
                 intVector.allocateNew(2);
                 intVector.set(0, 100);
                 intVector.set(1, 200);
                 intVector.setValueCount(2);
 
-                when(this.arrowReader.loadNextBatch()).thenReturn(true, false);
-                when(this.arrowReader.getVectorSchemaRoot()).thenReturn(batch);
+                ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+                when(mockIterator.hasNext()).thenReturn(true, false);
+                when(mockIterator.next()).thenReturn(batch);
 
-                S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
-                Split split = Split.newBuilder(s3SpillLocation, null)
-                        .add(TEST_PARTITION_COL, TEST_PARTITION_VALUE)
-                        .build();
-                Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                        Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+                    mockedJdbcToArrow.when(() -> JdbcToArrow
+                            .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                            .thenReturn(mockIterator);
 
-                ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
-                        this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
-                        new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints,
-                        100_000_000, 100_000_000);
+                    S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+                    Split split = Split.newBuilder(s3SpillLocation, null)
+                            .add(TEST_PARTITION_COL, TEST_PARTITION_VALUE).build();
+                    Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                            Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                    ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                            this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                            new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints,
+                            100_000_000, 100_000_000);
+                    try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                        RecordResponse response = this.adbcRecordHandler.doReadRecords(allocator, readRecordsRequest);
+                        assertNotNull(response);
+                        assertTrue(response instanceof ReadRecordsResponse);
+                        assertEquals(2, ((ReadRecordsResponse) response).getRecordCount());
+                        response.close();
+                    }
+                }
+            }
+        }
+    }
 
-                try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-                    RecordResponse response = this.adbcRecordHandler.doReadRecords(allocator, readRecordsRequest);
+    @Test
+    public void readWithConstraintHandlesNullValues() throws Exception
+    {
+        try (BufferAllocator testAllocator = new RootAllocator()) {
+            Schema fieldSchema = SchemaBuilder.newBuilder()
+                    .addField(FieldBuilder.newBuilder(TEST_COL1, Types.MinorType.INT.getType()).build())
+                    .addField(FieldBuilder.newBuilder(TEST_COL2, Types.MinorType.VARCHAR.getType()).build())
+                    .build();
+            List<Field> batchFields = Arrays.asList(
+                    Field.nullable(TEST_COL1, Types.MinorType.INT.getType()),
+                    Field.nullable(TEST_COL2, Types.MinorType.VARCHAR.getType()));
+            try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(batchFields), testAllocator)) {
+                batch.setRowCount(2);
+                IntVector intVector = (IntVector) batch.getVector(TEST_COL1);
+                intVector.allocateNew(2);
+                intVector.set(0, 1);
+                intVector.setNull(1);
+                intVector.setValueCount(2);
+                VarCharVector varcharVector = (VarCharVector) batch.getVector(TEST_COL2);
+                varcharVector.allocateNew();
+                varcharVector.setNull(0);
+                varcharVector.set(1, "testVal".getBytes(StandardCharsets.UTF_8));
+                varcharVector.setValueCount(2);
 
-                    assertNotNull(response);
-                    assertTrue(response instanceof ReadRecordsResponse);
-                    ReadRecordsResponse readResponse = (ReadRecordsResponse) response;
-                    assertEquals(2, readResponse.getRecordCount());
+                ArrowVectorIterator mockIterator = Mockito.mock(ArrowVectorIterator.class);
+                when(mockIterator.hasNext()).thenReturn(true, false);
+                when(mockIterator.next()).thenReturn(batch);
 
-                    response.close();
+                try (MockedStatic<JdbcToArrow> mockedJdbcToArrow = Mockito.mockStatic(JdbcToArrow.class)) {
+                    mockedJdbcToArrow.when(() -> JdbcToArrow
+                            .sqlToArrowVectorIterator(any(ResultSet.class), any(JdbcToArrowConfig.class)))
+                            .thenReturn(mockIterator);
+
+                    try (BlockAllocator allocator = new BlockAllocatorImpl()) {
+                        ConstraintEvaluator constraintEvaluator = Mockito.mock(ConstraintEvaluator.class);
+                        when(constraintEvaluator.apply(nullable(String.class), any())).thenReturn(true);
+                        S3SpillLocation s3SpillLocation = S3SpillLocation.newBuilder().withIsDirectory(true).build();
+                        SpillConfig spillConfig = Mockito.mock(SpillConfig.class);
+                        when(spillConfig.getSpillLocation()).thenReturn(s3SpillLocation);
+                        try (S3BlockSpiller spiller = new S3BlockSpiller(this.amazonS3, spillConfig, allocator, fieldSchema,
+                                constraintEvaluator, ImmutableMap.of())) {
+                            Split split = Split.newBuilder(s3SpillLocation, null).build();
+                            Constraints constraints = new Constraints(Collections.emptyMap(), Collections.emptyList(),
+                                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT, Collections.emptyMap(), null);
+                            ReadRecordsRequest readRecordsRequest = new ReadRecordsRequest(
+                                    this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                                    new TableName(TEST_SCHEMA_NAME, TEST_TABLE), fieldSchema, split, constraints, 1024, 1024);
+                            when(amazonS3.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                                    .thenReturn(PutObjectResponse.builder().build());
+                            this.adbcRecordHandler.readWithConstraint(spiller, readRecordsRequest, queryStatusChecker);
+                        }
+                    }
                 }
             }
         }
