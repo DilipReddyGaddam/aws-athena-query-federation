@@ -447,7 +447,7 @@ public abstract class JdbcSplitQueryBuilder
         return AnsiSqlDialect.DEFAULT;
     }
 
-    protected PreparedStatement prepareStatementWithCalciteSql(
+    public PreparedStatement prepareStatementWithCalciteSql(
             final Connection jdbcConnection,
             final Constraints constraints,
             final SqlDialect sqlDialect,
@@ -488,6 +488,7 @@ public abstract class JdbcSplitQueryBuilder
                     sql = sql + conjunction + splitWhere;
                 }
             }
+            System.out.println(sql);
             PreparedStatement statement = jdbcConnection.prepareStatement(sql);
             ParameterMetaData metaData = statement.getParameterMetaData();
             if (metaData != null && metaData.getParameterCount() != accumulator.size()) {
