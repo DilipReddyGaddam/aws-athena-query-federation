@@ -64,6 +64,7 @@ import org.apache.arrow.vector.holders.NullableFloat8Holder;
 import org.apache.arrow.vector.holders.NullableIntHolder;
 import org.apache.arrow.vector.holders.NullableSmallIntHolder;
 import org.apache.arrow.vector.holders.NullableTinyIntHolder;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.Assert;
@@ -680,5 +681,108 @@ public class JdbcRecordHandlerTest
         }
         Assert.assertTrue(names.contains("orders_view"));
         Assert.assertTrue(names.contains("customers_view"));
+    }
+
+    /**
+     * A connector that maps columns with {@link JdbcExportTypes}: duplicate column labels keep their own values
+     * (columns are written by position), the connector's value reader is used, and the export statement comes from
+     * {@link JdbcRecordHandler#prepareExportStatement}.
+     */
+    @Test
+    public void testDoReadRecordsDirectQueryWritesByPositionWithConnectorTypes() throws Exception {
+        Class.forName("org.h2.Driver");
+        java.sql.Connection h2 = java.sql.DriverManager.getConnection("jdbc:h2:mem:jdbcdqtypes;DB_CLOSE_DELAY=-1");
+        try (java.sql.Statement st = h2.createStatement()) {
+            st.execute("CREATE TABLE a (id INT, amount DECIMAL(10,2), notes CLOB)");
+            st.execute("CREATE TABLE b (id VARCHAR(10))");
+            st.execute("INSERT INTO a VALUES (1, 12.50, 'first note')");
+            st.execute("INSERT INTO b VALUES ('b-one')");
+        }
+        JdbcConnectionFactory h2Factory = Mockito.mock(JdbcConnectionFactory.class);
+        when(h2Factory.getConnection(nullable(CredentialsProvider.class))).thenReturn(h2);
+        S3Client mockS3 = Mockito.mock(S3Client.class);
+        java.util.Map<String, byte[]> written = java.util.Collections.synchronizedMap(new java.util.HashMap<>());
+        when(mockS3.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenAnswer((InvocationOnMock inv) -> {
+            PutObjectRequest req = (PutObjectRequest) inv.getArguments()[0];
+            RequestBody body = (RequestBody) inv.getArguments()[1];
+            written.put(req.key(), com.google.common.io.ByteStreams.toByteArray(body.contentStreamProvider().newStream()));
+            return PutObjectResponse.builder().build();
+        });
+        java.util.concurrent.atomic.AtomicInteger prepared = new java.util.concurrent.atomic.AtomicInteger();
+        DatabaseConnectionConfig cfg = new DatabaseConnectionConfig(TEST_CATALOG, "fakedatabase", CONNECTION_STRING, TEST_SECRET);
+        JdbcRecordHandler handler = new JdbcRecordHandler(mockS3, this.secretsManager, this.athena, cfg, h2Factory,
+                com.google.common.collect.ImmutableMap.of())
+        {
+            @Override
+            public PreparedStatement buildSplitSql(Connection c, String cat, TableName t, Schema s, Constraints con, Split sp)
+            {
+                throw new UnsupportedOperationException("export query must not call buildSplitSql");
+            }
+
+            @Override
+            protected PreparedStatement prepareExportStatement(Connection connection, String query) throws SQLException
+            {
+                prepared.incrementAndGet();
+                return super.prepareExportStatement(connection, query);
+            }
+
+            @Override
+            protected Schema deriveExportSchema(ResultSet resultSet) throws SQLException
+            {
+                java.sql.ResultSetMetaData metadata = resultSet.getMetaData();
+                java.util.List<Field> fields = new java.util.ArrayList<>();
+                for (int column = 1; column <= metadata.getColumnCount(); column++) {
+                    fields.add(Field.nullable(metadata.getColumnLabel(column),
+                            JdbcExportTypes.defaultArrowType(metadata, column, configOptions)));
+                }
+                return new Schema(fields);
+            }
+
+            @Override
+            protected Object readExportValue(ResultSet resultSet, int column, Field field) throws SQLException
+            {
+                return JdbcExportTypes.readValue(resultSet, column, field.getType());
+            }
+        };
+
+        S3SpillLocation splitLoc = S3SpillLocation.newBuilder()
+                .withBucket("test-bucket").withPrefix("prefix").withQueryId("q2").withSplitId("split2").withIsDirectory(true).build();
+        Split split = Split.newBuilder(splitLoc, null).build();
+        Map<String, String> qptArgs = new HashMap<>();
+        qptArgs.put(JdbcRecordHandler.EXPORT_SCHEMA, "true");
+        qptArgs.put(com.amazonaws.athena.connectors.jdbc.qpt.JdbcQueryPassthrough.QUERY,
+                "SELECT a.id, a.amount, a.notes, b.id FROM a CROSS JOIN b");
+        ReadRecordsRequest request = new ReadRecordsRequest(this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                new TableName("", ""), new Schema(Collections.emptyList()), split,
+                new Constraints(Collections.emptyMap(), Collections.emptyList(), Collections.emptyList(),
+                        Constraints.DEFAULT_NO_LIMIT, qptArgs, null),
+                100_000_000_000L, 0);
+
+        com.amazonaws.athena.connector.lambda.records.RemoteReadRecordsResponse remote =
+                (com.amazonaws.athena.connector.lambda.records.RemoteReadRecordsResponse) handler.doReadRecords(
+                        new BlockAllocatorImpl(), request);
+
+        Assert.assertEquals(1, prepared.get());
+        Schema schema = remote.getSchema();
+        Assert.assertEquals(4, schema.getFields().size());
+        Assert.assertEquals(new ArrowType.Int(32, true), schema.getFields().get(0).getType());
+        Assert.assertEquals(JdbcExportTypes.decimal(10, 2), schema.getFields().get(1).getType());
+        Assert.assertEquals(ArrowType.Utf8.INSTANCE, schema.getFields().get(2).getType());
+        Assert.assertEquals(ArrowType.Utf8.INSTANCE, schema.getFields().get(3).getType());
+
+        // No encryption key, so the objects are written in the clear (NoOp crypto).
+        com.amazonaws.athena.connector.lambda.security.NoOpBlockCrypto crypto =
+                new com.amazonaws.athena.connector.lambda.security.NoOpBlockCrypto(new BlockAllocatorImpl());
+        com.amazonaws.athena.connector.lambda.data.Block block =
+                crypto.decrypt(null, written.get(splitLoc.getKey() + ".0"), schema);
+        Assert.assertEquals(1, block.getRowCount());
+        java.util.List<org.apache.arrow.vector.FieldVector> vectors = block.getFieldVectors();
+        Assert.assertEquals(1, ((org.apache.arrow.vector.IntVector) vectors.get(0)).get(0));
+        Assert.assertEquals(new java.math.BigDecimal("12.50"),
+                ((org.apache.arrow.vector.DecimalVector) vectors.get(1)).getObject(0));
+        Assert.assertEquals("first note", new String(((org.apache.arrow.vector.VarCharVector) vectors.get(2)).get(0),
+                StandardCharsets.UTF_8));
+        Assert.assertEquals("b-one", new String(((org.apache.arrow.vector.VarCharVector) vectors.get(3)).get(0),
+                StandardCharsets.UTF_8));
     }
 }
