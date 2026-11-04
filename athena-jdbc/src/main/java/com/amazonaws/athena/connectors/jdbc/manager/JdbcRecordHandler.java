@@ -297,7 +297,7 @@ public abstract class JdbcRecordHandler
         DateTimeFormatterUtil.overrideTimezonePacking(false);
         try (Connection connection = getJdbcConnectionFactory().getConnection(getCredentialProvider(getRequestOverrideConfig(request)))) {
             connection.setAutoCommit(false); // enable server-side streaming for large result sets
-            try (PreparedStatement preparedStatement = connection.prepareStatement(passThroughQuery);
+            try (PreparedStatement preparedStatement = prepareExportStatement(connection, passThroughQuery);
                     ResultSet resultSet = preparedStatement.executeQuery()) {
                 // Derive the Arrow schema from the ResultSet itself (faithful column names AND types).
                 // Overridable so connectors can adjust the type mapping (e.g. preserve NUMBER(p,0) precision).
@@ -311,12 +311,14 @@ public abstract class JdbcRecordHandler
                         S3BlockSpiller spiller = new S3BlockSpiller(s3Client, spillConfig, allocator, derivedSchema, evaluator, configOptions)) {
                     // Populate the Arrow vectors directly with BlockUtils.setValue, which already handles the full
                     // type range (including timestamp-with-timezone) that arbitrary export results can contain.
+                    // Columns are addressed by position, so duplicate labels (for example a.id, b.id) keep their own values.
+                    List<Field> fields = derivedSchema.getFields();
                     long rowsReturnedFromDatabase = 0;
                     while (resultSet.next()) {
                         spiller.writeRows((Block block, int rowNum) -> {
-                            for (Field field : derivedSchema.getFields()) {
-                                BlockUtils.setValue(block.getFieldVector(field.getName()), rowNum,
-                                        resultSet.getObject(field.getName()));
+                            List<FieldVector> vectors = block.getFieldVectors();
+                            for (int i = 0; i < fields.size(); i++) {
+                                BlockUtils.setValue(vectors.get(i), rowNum, readExportValue(resultSet, i + 1, fields.get(i)));
                             }
                             return 1;
                         });
@@ -352,6 +354,25 @@ public abstract class JdbcRecordHandler
     {
         return JdbcToArrowUtils.jdbcToArrowSchema(resultSet.getMetaData(),
                 Calendar.getInstance(TimeZone.getTimeZone("UTC")));
+    }
+
+    /**
+     * Prepares the export query. Connectors override this to set driver options, such as the fetch size that makes
+     * the driver stream the result instead of reading all of it into memory.
+     */
+    protected PreparedStatement prepareExportStatement(Connection connection, String query) throws SQLException
+    {
+        return connection.prepareStatement(query);
+    }
+
+    /**
+     * Reads the value of {@code column} (1-based) in the current row for the export field {@code field}. The default
+     * is {@link ResultSet#getObject(int)}; connectors that map columns with {@link JdbcExportTypes} read them with
+     * {@link JdbcExportTypes#readValue} instead, so the value matches the field's type.
+     */
+    protected Object readExportValue(ResultSet resultSet, int column, Field field) throws SQLException
+    {
+        return resultSet.getObject(column);
     }
 
     /**
