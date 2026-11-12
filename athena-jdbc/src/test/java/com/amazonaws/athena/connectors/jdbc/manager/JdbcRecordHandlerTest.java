@@ -681,4 +681,55 @@ public class JdbcRecordHandlerTest
         Assert.assertTrue(names.contains("orders_view"));
         Assert.assertTrue(names.contains("customers_view"));
     }
+
+    @Test
+    public void testDoReadRecordsDirectQueryPreparesThroughExportHook() throws Exception {
+        Class.forName("org.h2.Driver");
+        java.sql.Connection h2 = java.sql.DriverManager.getConnection("jdbc:h2:mem:jdbcdqhook;DB_CLOSE_DELAY=-1");
+        try (java.sql.Statement st = h2.createStatement()) {
+            st.execute("CREATE TABLE w (id INT)");
+            st.execute("INSERT INTO w VALUES (1), (2), (3)");
+        }
+        JdbcConnectionFactory h2Factory = Mockito.mock(JdbcConnectionFactory.class);
+        when(h2Factory.getConnection(nullable(CredentialsProvider.class))).thenReturn(h2);
+        S3Client mockS3 = Mockito.mock(S3Client.class);
+        when(mockS3.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenReturn(PutObjectResponse.builder().build());
+        DatabaseConnectionConfig cfg = new DatabaseConnectionConfig(TEST_CATALOG, "fakedatabase", CONNECTION_STRING, TEST_SECRET);
+        java.util.List<String> prepared = new java.util.ArrayList<>();
+        JdbcRecordHandler handler = new JdbcRecordHandler(mockS3, this.secretsManager, this.athena, cfg, h2Factory,
+                com.google.common.collect.ImmutableMap.of())
+        {
+            @Override
+            public PreparedStatement buildSplitSql(Connection c, String cat, TableName t, Schema s, Constraints con, Split sp)
+            {
+                throw new UnsupportedOperationException("export query must not call buildSplitSql");
+            }
+
+            @Override
+            protected PreparedStatement prepareExportStatement(Connection connection, String query) throws SQLException
+            {
+                prepared.add(query);
+                PreparedStatement statement = super.prepareExportStatement(connection, query);
+                statement.setFetchSize(2);
+                return statement;
+            }
+        };
+
+        S3SpillLocation splitLoc = S3SpillLocation.newBuilder()
+                .withBucket("test-bucket").withPrefix("prefix").withQueryId("q2").withSplitId("split2").withIsDirectory(true).build();
+        Split split = Split.newBuilder(splitLoc, new com.amazonaws.athena.connector.lambda.security.LocalKeyFactory().create()).build();
+        Map<String, String> qptArgs = new HashMap<>();
+        qptArgs.put(JdbcRecordHandler.EXPORT_SCHEMA, "true");
+        qptArgs.put(com.amazonaws.athena.connectors.jdbc.qpt.JdbcQueryPassthrough.QUERY, "SELECT id FROM w ORDER BY id");
+        ReadRecordsRequest request = new ReadRecordsRequest(this.federatedIdentity, TEST_CATALOG, TEST_QUERY_ID,
+                new TableName(TEST_SCHEMA, TEST_TABLE), SchemaBuilder.newBuilder().addStringField("id").build(), split,
+                new Constraints(Collections.emptyMap(), Collections.emptyList(), Collections.emptyList(),
+                        Constraints.DEFAULT_NO_LIMIT, qptArgs, null),
+                100_000_000_000L, 100_000_000_000L);
+
+        com.amazonaws.athena.connector.lambda.records.RecordResponse response = handler.doReadRecords(new BlockAllocatorImpl(), request);
+
+        Assert.assertEquals(java.util.List.of("SELECT id FROM w ORDER BY id"), prepared);
+        Assert.assertTrue(response instanceof com.amazonaws.athena.connector.lambda.records.RemoteReadRecordsResponse);
+    }
 }

@@ -297,7 +297,7 @@ public abstract class JdbcRecordHandler
         DateTimeFormatterUtil.overrideTimezonePacking(false);
         try (Connection connection = getJdbcConnectionFactory().getConnection(getCredentialProvider(getRequestOverrideConfig(request)))) {
             connection.setAutoCommit(false); // enable server-side streaming for large result sets
-            try (PreparedStatement preparedStatement = connection.prepareStatement(passThroughQuery);
+            try (PreparedStatement preparedStatement = prepareExportStatement(connection, passThroughQuery);
                     ResultSet resultSet = preparedStatement.executeQuery()) {
                 // Derive the Arrow schema from the ResultSet itself (faithful column names AND types).
                 // Overridable so connectors can adjust the type mapping (e.g. preserve NUMBER(p,0) precision).
@@ -341,6 +341,15 @@ public abstract class JdbcRecordHandler
         finally {
             DateTimeFormatterUtil.clearTimezonePackingOverride();
         }
+    }
+
+    /**
+     * Prepares the pass-through export query. Connectors may override to set driver options, for example a fetch
+     * size so the driver streams the result instead of reading it all into memory.
+     */
+    protected PreparedStatement prepareExportStatement(Connection connection, String query) throws SQLException
+    {
+        return connection.prepareStatement(query);
     }
 
     /**
