@@ -69,6 +69,8 @@ public class PostGreSqlRecordHandler
     private static final Logger LOGGER = LoggerFactory.getLogger(PostGreSqlRecordHandler.class);
 
     private static final int FETCH_SIZE = 1000;
+    // Larger than FETCH_SIZE: export reads stream whole result sets, so fewer round trips matter more.
+    private static final int EXPORT_FETCH_SIZE = 3000;
     private static final int DECIMAL_BIT_WIDTH = 128;
     private static final String DEFAULT_SCALE_KEY = "default_scale";
 
@@ -125,7 +127,7 @@ public class PostGreSqlRecordHandler
     {
         PreparedStatement preparedStatement = super.prepareExportStatement(connection, query);
         // Without a fetch size, pgjdbc reads the whole result into memory, even with auto-commit off.
-        preparedStatement.setFetchSize(FETCH_SIZE);
+        preparedStatement.setFetchSize(EXPORT_FETCH_SIZE);
         return preparedStatement;
     }
 

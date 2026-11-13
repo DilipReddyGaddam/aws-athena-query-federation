@@ -1295,7 +1295,7 @@ public class PostGreSqlRecordHandlerTest extends TestBase
         Mockito.when(this.connection.prepareStatement("SELECT 1")).thenReturn(preparedStatement);
 
         Assert.assertSame(preparedStatement, this.postGreSqlRecordHandler.prepareExportStatement(this.connection, "SELECT 1"));
-        Mockito.verify(preparedStatement).setFetchSize(1000);
+        Mockito.verify(preparedStatement).setFetchSize(3000);
     }
 
     @Test
